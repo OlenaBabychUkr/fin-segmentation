@@ -1,0 +1,198 @@
+# ===========================================================================
+# docker-compose.yml — Dolphin Fin Segmentation System
+# ===========================================================================
+#
+# Services:
+#   - inference     : FastAPI segmentation API (Part 1)
+#   - minio         : S3-compatible object storage / data lake (Part 2)
+#   - minio-init    : one-shot bucket creation
+#   - postgres      : metadata DB for Airflow + dataset manifests (Part 2)
+#   - airflow-init  : DB init + admin user creation
+#   - airflow-web   : Airflow webserver (Part 2)
+#   - airflow-sched : Airflow scheduler (Part 2)
+#
+# ⚠️  CREDENTIALS:
+#   Copy .env.example → .env and fill in real values.
+#   NEVER commit .env to git (it is in .gitignore).
+#
+# Usage:
+#   Part 1 only (inference + MinIO):
+#     docker-compose up inference minio minio-init
+#
+#   Full stack (add Airflow):
+#     docker-compose up
+# ===========================================================================
+
+version: "3.9"
+
+x-airflow-common: &airflow-common
+  image: apache/airflow:2.9.3-python3.11
+  environment:
+    AIRFLOW__CORE__EXECUTOR: LocalExecutor
+    AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: postgresql+psycopg2://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB}
+    AIRFLOW__CORE__FERNET_KEY: ${AIRFLOW_FERNET_KEY}
+    AIRFLOW__WEBSERVER__SECRET_KEY: ${AIRFLOW_SECRET_KEY}
+    AIRFLOW__CORE__LOAD_EXAMPLES: "false"
+    # MinIO / S3 connection passed to DAG via env
+    MINIO_ENDPOINT: http://minio:9000
+    MINIO_ACCESS_KEY: ${MINIO_ACCESS_KEY}
+    MINIO_SECRET_KEY: ${MINIO_SECRET_KEY}
+    # ⚠️ Google Drive credentials: set via Airflow Connection UI (not in env)
+    # Connection id: google_drive_default
+    # See airflow/README_connections.md for setup instructions
+  volumes:
+    - ./airflow/dags:/opt/airflow/dags
+    - ./airflow/logs:/opt/airflow/logs
+    - ./airflow/plugins:/opt/airflow/plugins
+    - airflow_pip_cache:/root/.cache/pip
+  depends_on:
+    postgres:
+      condition: service_healthy
+  networks:
+    - dolphin-net
+
+services:
+
+  # ─── Inference API ────────────────────────────────────────────────────────
+  inference:
+    build:
+      context: ./inference
+      dockerfile: Dockerfile
+    image: dolphin-inference:latest
+    ports:
+      - "8000:8000"
+    environment:
+      MODEL_DEVICE: cpu
+      # ⚠️ PLACEHOLDER: override MODEL_PATH to use custom checkpoint
+      # MODEL_PATH: /weights/dolphin_fin_yolo_seg_v1.pt
+      MODEL_NAME: yolov8n-seg.pt
+      MODEL_PATH: /weights/yolov8n-seg.pt
+    volumes:
+      # Mount host weights dir (empty by default) — place custom .pt here
+      - ./weights:/weights:ro
+      # Persist auto-downloaded YOLO weights across restarts
+      - yolo_cache:/tmp/ultralytics
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 60s
+    networks:
+      - dolphin-net
+
+  # ─── MinIO (S3-compatible object storage) ─────────────────────────────────
+  minio:
+    image: minio/minio:RELEASE.2024-06-13T22-53-53Z
+    command: server /data --console-address ":9001"
+    ports:
+      - "9000:9000"   # S3 API
+      - "9001:9001"   # Web console  →  http://localhost:9001
+    environment:
+      MINIO_ROOT_USER: ${MINIO_ACCESS_KEY}
+      MINIO_ROOT_PASSWORD: ${MINIO_SECRET_KEY}
+    volumes:
+      - minio_data:/data
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:9000/minio/health/live"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+    networks:
+      - dolphin-net
+
+  # One-shot: create required MinIO buckets on first start
+  minio-init:
+    image: minio/mc:RELEASE.2024-06-10T16-36-24Z
+    depends_on:
+      minio:
+        condition: service_healthy
+    entrypoint: >
+      /bin/sh -c "
+        mc alias set local http://minio:9000 $${MINIO_ACCESS_KEY} $${MINIO_SECRET_KEY};
+        mc mb --ignore-existing local/dolphin-fins-raw;
+        mc mb --ignore-existing local/dolphin-fins-annotated;
+        mc mb --ignore-existing local/dolphin-fins-manifests;
+        echo 'MinIO buckets ready.';
+      "
+    environment:
+      MINIO_ACCESS_KEY: ${MINIO_ACCESS_KEY}
+      MINIO_SECRET_KEY: ${MINIO_SECRET_KEY}
+    networks:
+      - dolphin-net
+
+  # ─── PostgreSQL (Airflow metadata + dataset manifests) ────────────────────
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      POSTGRES_DB: ${POSTGRES_DB}
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      # Init script: creates dataset_uploads table alongside airflow DB
+      - ./airflow/init_db.sql:/docker-entrypoint-initdb.d/init_db.sql:ro
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER} -d ${POSTGRES_DB}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks:
+      - dolphin-net
+
+  # Airflow DB init (runs once, then exits)
+  airflow-init:
+    <<: *airflow-common
+    command: >
+      bash -c "
+        pip install --quiet google-api-python-client google-auth minio imagehash Pillow &&
+        airflow db migrate &&
+        airflow users create --username admin --password admin
+          --firstname Admin --lastname Admin --role Admin --email admin@example.com || true
+      "
+    restart: on-failure
+    networks:
+      - dolphin-net
+
+  airflow-web:
+    <<: *airflow-common
+    command: >
+      bash -c "
+        pip install --quiet google-api-python-client google-auth minio imagehash Pillow &&
+        airflow webserver
+      "
+    ports:
+      - "8080:8080"   # Airflow UI  →  http://localhost:8080  (admin/admin)
+    restart: unless-stopped
+    depends_on:
+      airflow-init:
+        condition: service_completed_successfully
+    networks:
+      - dolphin-net
+
+  airflow-sched:
+    <<: *airflow-common
+    command: >
+      bash -c "
+        pip install --quiet google-api-python-client google-auth minio imagehash Pillow &&
+        airflow scheduler
+      "
+    restart: unless-stopped
+    depends_on:
+      airflow-init:
+        condition: service_completed_successfully
+    networks:
+      - dolphin-net
+
+volumes:
+  yolo_cache:
+  minio_data:
+  postgres_data:
+  airflow_pip_cache:
+
+networks:
+  dolphin-net:
+    driver: bridge
