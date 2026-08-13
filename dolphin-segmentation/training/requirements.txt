@@ -1,0 +1,2 @@
+mlflow==3.15.1
+ultralytics>=8.3,<9
