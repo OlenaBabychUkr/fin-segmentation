@@ -1,0 +1,41 @@
+# ⚠️ Privacy: raw dataset, credentials, and model weights must NOT be committed.
+# (High-level design §Privacy requirements)
+
+# Credentials and secrets
+.env
+*.json
+service_account*.json
+secrets/
+*.json
+
+# Model weights (potentially large + proprietary)
+weights/
+*.pt
+*.pth
+runs/
+
+# Raw dataset (private — ~1400 images)
+data/
+datasets/
+*.zip
+
+# Airflow runtime
+airflow/logs/
+airflow/plugins/__pycache__/
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+venv/
+*.egg-info/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# IDE
+.idea/
+.vscode/
+*.swp
