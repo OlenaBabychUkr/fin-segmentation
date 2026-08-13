@@ -37,6 +37,8 @@ x-airflow-common: &airflow-common
     MINIO_ENDPOINT: http://minio:9000
     MINIO_ACCESS_KEY: ${MINIO_ACCESS_KEY}
     MINIO_SECRET_KEY: ${MINIO_SECRET_KEY}
+
+    GOOGLE_DRIVE_FOLDER_ID: ${GOOGLE_DRIVE_FOLDER_ID}
     # ⚠️ Google Drive credentials: set via Airflow Connection UI (not in env)
     # Connection id: google_drive_default
     # See airflow/README_connections.md for setup instructions
@@ -44,6 +46,7 @@ x-airflow-common: &airflow-common
     - ./airflow/dags:/opt/airflow/dags
     - ./airflow/logs:/opt/airflow/logs
     - ./airflow/plugins:/opt/airflow/plugins
+    - ./secrets/google-service-account.json:/opt/airflow/secrets/google-service-account.json:ro
     - airflow_pip_cache:/root/.cache/pip
   depends_on:
     postgres:
@@ -115,6 +118,7 @@ services:
         mc mb --ignore-existing local/dolphin-fins-raw;
         mc mb --ignore-existing local/dolphin-fins-annotated;
         mc mb --ignore-existing local/dolphin-fins-manifests;
+        mc mb --ignore-existing local/mlflow-artifacts;
         echo 'MinIO buckets ready.';
       "
     environment:
@@ -150,8 +154,7 @@ services:
       bash -c "
         pip install --quiet google-api-python-client google-auth minio imagehash Pillow &&
         airflow db migrate &&
-        airflow users create --username admin --password admin
-          --firstname Admin --lastname Admin --role Admin --email admin@example.com || true
+        airflow users create --username admin --password admin --firstname Admin --lastname Admin --role Admin --email admin@example.com || true
       "
     restart: on-failure
     networks:
@@ -187,11 +190,69 @@ services:
     networks:
       - dolphin-net
 
+  mlflow:
+    image: python:3.11-slim
+    command: >
+      sh -c "pip install --no-cache-dir mlflow psycopg2-binary boto3 &&
+      mlflow server
+      --backend-store-uri postgresql+psycopg2://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres:5432/mlflow
+      --artifacts-destination s3://mlflow-artifacts
+      --host 0.0.0.0
+      --allowed-hosts 'mlflow:5000,localhost:*,127.0.0.1:*'
+      --port 5000"
+    environment:
+      AWS_ACCESS_KEY_ID: ${MINIO_ACCESS_KEY}
+      AWS_SECRET_ACCESS_KEY: ${MINIO_SECRET_KEY}
+      MLFLOW_S3_ENDPOINT_URL: http://minio:9000
+    ports:
+      - "5000:5000"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      minio:
+        condition: service_healthy
+    restart: unless-stopped
+    networks:
+      - dolphin-net
+
+  training:
+    build:
+      context: ./training
+      dockerfile: Dockerfile
+    environment:
+      MLFLOW_TRACKING_URI: http://mlflow:5000
+      MLFLOW_EXPERIMENT: dolphin-fin-segmentation
+
+      MODEL_PATH: /weights/yolov8n-seg.pt
+      DATA_YAML: /data/data.yaml
+      DATASET_VERSION: roboflow-seg-v1
+
+      EPOCHS: "20"
+      IMGSZ: "448"
+      BATCH: "4"
+      DEVICE: "cpu"
+      WORKERS: "2"
+
+      RUNS_DIR: /runs
+
+    volumes:
+      - ./training/dataset_yolo:/data:ro
+      - ./weights:/weights:ro
+      - ./training/runs:/runs
+
+    depends_on:
+      - mlflow
+
+    networks:
+      - dolphin-net
+
+
 volumes:
   yolo_cache:
   minio_data:
   postgres_data:
   airflow_pip_cache:
+
 
 networks:
   dolphin-net:
