@@ -49,12 +49,26 @@ logger = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 
 # ⚠️ PLACEHOLDER: pretrained COCO model — replace with custom checkpoint
-MODEL_NAME = os.getenv("MODEL_NAME", "yolov8n-seg.pt")
-# When using a custom-trained checkpoint, set MODEL_PATH to the file path:
-#   MODEL_PATH = "/weights/dolphin_fin_yolo_seg_v1.pt"
-# and update MODEL_NAME to something like "dolphin_fin_yolo_seg_v1".
-MODEL_PATH = os.getenv("MODEL_PATH", MODEL_NAME)  # falls back to auto-download
+MLFLOW_TRACKING_URI = os.getenv(
+    "MLFLOW_TRACKING_URI",
+    "http://mlflow:5000",
+)
 
+MLFLOW_MODEL_NAME = os.getenv(
+    "MLFLOW_MODEL_NAME",
+    "dolphin-fin-segmentation",
+)
+
+MLFLOW_MODEL_ALIAS = os.getenv(
+    "MLFLOW_MODEL_ALIAS",
+    "champion",
+)
+
+MODEL_NAME = f"{MLFLOW_MODEL_NAME}@{MLFLOW_MODEL_ALIAS}"
+
+DEVICE = os.getenv("MODEL_DEVICE", "cpu")
+
+FILTER_CLASSES: Optional[List[int]] = [0]
 # Class filter: for the pretrained COCO model we keep all classes (None).
 # ⚠️ PLACEHOLDER: once the custom model is loaded, set to None or [0]
 #    (custom model likely has a single "fin" class at index 0).
@@ -72,14 +86,56 @@ _model = None
 
 
 def get_model():
-    """Return (and lazily load) the YOLO segmentation model."""
+    """
+    Lazily load the current champion YOLO model from MLflow Model Registry.
+    """
     global _model
-    if _model is None:
-        from ultralytics import YOLO  # deferred to avoid import-time cost
 
-        logger.info("Loading YOLO segmentation model: %s (device=%s)", MODEL_PATH, DEVICE)
-        _model = YOLO(MODEL_PATH)
-        logger.info("Model loaded successfully")
+    if _model is None:
+        import mlflow
+        from mlflow import MlflowClient
+        from ultralytics import YOLO
+
+        mlflow.set_tracking_uri(MLFLOW_TRACKING_URI)
+        client = MlflowClient()
+
+        logger.info(
+            "Resolving MLflow champion: %s@%s",
+            MLFLOW_MODEL_NAME,
+            MLFLOW_MODEL_ALIAS,
+        )
+
+        model_version = client.get_model_version_by_alias(
+            MLFLOW_MODEL_NAME,
+            MLFLOW_MODEL_ALIAS,
+        )
+
+        logger.info(
+            "Champion resolved to model version %s, run_id=%s",
+            model_version.version,
+            model_version.run_id,
+        )
+
+        # best.pt was also logged as a normal run artifact.
+        weights_path = mlflow.artifacts.download_artifacts(
+            run_id=model_version.run_id,
+            artifact_path="ultralytics_run/weights/best.pt",
+        )
+
+        logger.info(
+            "Champion weights downloaded to: %s",
+            weights_path,
+        )
+
+        _model = YOLO(weights_path)
+
+        logger.info(
+            "Champion YOLO model loaded successfully "
+            "(version=%s, device=%s)",
+            model_version.version,
+            DEVICE,
+        )
+
     return _model
 
 
